@@ -1,0 +1,89 @@
+name: Build and Push Docker Image main
+on:
+  # push:
+  #   branches:
+  #     - "main"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    environment: main
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: "main"
+
+      - name: Log in to GitHub Repository
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Convert repository owner and name to lowercase
+        id: vars
+        run: |
+          echo "REPO_OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Set current date
+        id: date
+        run: echo "DATE=main-$(TZ='Europe/Minsk' date +%Y-%m-%d-%Hh%Mm)" >> $GITHUB_ENV
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v2
+        with:
+          context: ./
+          file: ./Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/uma-mcp-server:${{ env.DATE }}
+
+      - name: Checkout infra repository
+        uses: actions/checkout@v4
+        with:
+          repository: semantic-hallucinations/uma-infrastructure
+          token: ${{ secrets.TOKEN }}
+          path: uma-infrastructure
+          ref: main
+
+      - name: Update image tag in values-main.yaml
+        run: |
+          ls
+          echo "my infra"
+          cd uma-infrastructure
+          ls
+
+          NEW_TAG="${{ env.DATE }}"
+          if [[ -z "$NEW_TAG" ]]; then
+            echo "Пустой тег!"
+            exit 1
+          fi
+
+          echo "Tag"
+          echo $NEW_TAG
+
+          if ! command -v yq &> /dev/null; then
+            echo "Installing yq..."
+            sudo apt-get update && sudo apt-get install -y jq
+            sudo wget https://github.com/mikefarah/yq/releases/download/v4.17.1/yq_linux_amd64 -O /usr/local/bin/yq
+            sudo chmod +x /usr/local/bin/yq
+          fi
+
+          yq eval ".image.tag = \"$NEW_TAG\"" -i k8s/applications/ai/uma_mcp_server/values-main.yaml
+
+          echo "tag"
+          cat k8s/applications/ai/uma_mcp_server/values-main.yaml
+
+      - name: Commit and push changes
+        run: |
+          cd uma-infrastructure
+          git config --global user.name "Bot Updater"
+          git config --global user.email "actions@github.com"
+          git add k8s/applications/ai/uma_mcp_server/values-main.yaml
+          git commit -m "Uma mcp server update to ${{ github.ref_name }}"
+          git push
