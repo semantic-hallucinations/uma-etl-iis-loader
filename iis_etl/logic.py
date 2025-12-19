@@ -21,28 +21,23 @@ def _parse_weeks(weeks_list: list) -> list:
     return weeks_list
 
 def _extract_aud_names(auds: list) -> list:
-    """Извлекает имена аудиторий, поддерживая и объекты, и строки"""
     if not auds: return []
     res = []
     for a in auds:
         if isinstance(a, dict):
-            # Если объект - берем name или id
             val = a.get('name') or str(a.get('id', ''))
             if val: res.append(val)
         elif isinstance(a, str):
-            # Если строка - берем как есть
             res.append(a)
         elif isinstance(a, int):
             res.append(str(a))
     return res
 
 def _extract_names_safe(items: list, key='name') -> list:
-    """Безопасное извлечение имен из списка смешанных типов (dict/str)"""
     if not items: return []
     res = []
     for i in items:
         if isinstance(i, dict):
-            # Для людей собираем ФИО, для групп - name
             if key == 'fio':
                 last = i.get('lastName', '')
                 first = i.get('firstName', '')
@@ -59,10 +54,6 @@ def _parse_date(date_str: str) -> date:
         return datetime.strptime(date_str, "%d.%m.%Y").date()
     except (ValueError, TypeError):
         return None
-
-# ============================
-# TIER A: REFERENCE DATA
-# ============================
 
 async def sync_system_state(session: AsyncSession, client: BsuirApiClient):
     logger.info("Обновление system_state (current_week)...")
@@ -183,8 +174,11 @@ async def sync_employees(session: AsyncSession, client: BsuirApiClient):
     logger.info("Синхронизация сотрудников...")
     data = await client.get_employees()
     
-    d_res = await session.execute(select(Department.id, Department.name))
-    dept_map = {name.lower(): did for did, name in d_res.all()}
+    d_res = await session.execute(select(Department.id, Department.name, Department.abbr))
+    dept_map = {}
+    for did, name, abbr in d_res.all():
+        if name: dept_map[name.strip().lower()] = did
+        if abbr: dept_map[abbr.strip().lower()] = did
 
     for item in data:
         if not item.get('urlId'): continue 
@@ -203,10 +197,17 @@ async def sync_employees(session: AsyncSession, client: BsuirApiClient):
         await session.execute(delete(DepartmentEmployee).where(DepartmentEmployee.employee_id == item['id']))
         api_depts = item.get('academicDepartment', [])
         links = set()
+        
         for d_entry in api_depts:
+            d_val = None
             if isinstance(d_entry, str):
-                d_id = dept_map.get(d_entry.strip().lower())
-                if d_id: links.add(d_id)
+                d_val = d_entry
+            elif isinstance(d_entry, dict):
+                d_val = d_entry.get('name') or d_entry.get('abbrev')
+            
+            if d_val:
+                did = dept_map.get(d_val.strip().lower())
+                if did: links.add(did)
         
         if links:
             vals = [{"department_id": did, "employee_id": item['id']} for did in links]
@@ -267,52 +268,42 @@ async def sync_auditories(session: AsyncSession, client: BsuirApiClient):
         await session.execute(stmt)
     await session.commit()
 
-# ============================
-# TIER B: SCHEDULES
-# ============================
-
 async def _process_schedule_json(
     session: AsyncSession, entity_name: str, entity_type: str, data: dict, employee_id: int = None
 ):
-    # 1. SCD2 для JSON
     if entity_type == 'group':
         filter_cond = (ScheduleJsonStorage.group_name == entity_name)
     else:
-        # Для сотрудников важно фильтровать по ID, т.к. entity_name у них url_id
         if not employee_id:
-             logger.warning(f"Пропуск сохранения JSON для {entity_name}: нет employee_id")
+             logger.warning(f"SKIP JSON for {entity_name}: employee_id is None")
              return
         filter_cond = (ScheduleJsonStorage.employee_id == employee_id)
 
-    # Закрываем старую запись
     await session.execute(
         update(ScheduleJsonStorage)
         .where(filter_cond, ScheduleJsonStorage.entity_type == entity_type, ScheduleJsonStorage.valid_to.is_(None))
         .values(valid_to=func.now())
     )
 
-    # Создаем новую
-    # Если это препод, group_name = NULL, employee_id = ID. Это корректно по схеме.
     new_json = ScheduleJsonStorage(
         group_name=entity_name if entity_type == 'group' else None,
-        employee_id=employee_id, 
+        employee_id=employee_id if entity_type == 'employee' else None,
         entity_type=entity_type, 
         data=data,
         api_last_update_ts=datetime.now(), 
         valid_from=func.now()
     )
     session.add(new_json)
+    await session.flush()
     
     events = []
+    schedules = data.get('schedules', {}) or {}
     
-    # --- FIX: Защита от битых данных при подсчете студентов ---
     if entity_type == 'group':
         student_count_found = None
-        schedules = data.get('schedules', {}) or {}
         if isinstance(schedules, dict):
             for lessons in schedules.values():
                 for l in lessons:
-                    # studentGroups может быть None или списком строк
                     groups_list = l.get('studentGroups') or []
                     for g in groups_list:
                         if isinstance(g, dict) and g.get('name') == entity_name:
@@ -330,8 +321,6 @@ async def _process_schedule_json(
                 .values(number_of_students=student_count_found)
             )
 
-    # 2. Парсинг Занятий
-    schedules = data.get('schedules', {}) or {}
     if isinstance(schedules, dict):
         for day_name, lessons in schedules.items():
             day_num = DAYS_MAP.get(day_name)
@@ -343,15 +332,12 @@ async def _process_schedule_json(
                     e_time = datetime.strptime(lesson['endLessonTime'], '%H:%M').time()
                 except: continue 
 
-                # FIX: Теперь аудитории извлекаются корректно даже если это строки
                 aud_names = _extract_aud_names(lesson.get('auditories', []))
                 weeks = _parse_weeks(lesson.get('weekNumber', []))
                 
-                # Подготовка Search Raw
                 subj = lesson.get('subject', 'Без названия') or 'Без названия'
                 subj_full = lesson.get('subjectFullName') or subj
                 
-                # FIX: Безопасное извлечение имен для поиска
                 emp_names = _extract_names_safe(lesson.get('employees', []), key='fio')
                 grp_names = _extract_names_safe(lesson.get('studentGroups', []), key='name')
 
@@ -370,10 +356,8 @@ async def _process_schedule_json(
                     "related_groups": lesson.get('studentGroups', []),
                     "related_employees": lesson.get('employees', []),
                     "subgroup": lesson.get('numSubgroup', 0),
-                    # Вектор не передаем, он генерируется SQL-запросом позже
                 })
 
-    # Парсинг Экзаменов
     exams = data.get('exams', []) or []
     for exam in exams:
         date_obj = _parse_date(exam.get('dateLesson'))
@@ -397,19 +381,16 @@ async def _process_schedule_json(
             "exact_date": date_obj,
             "related_groups": exam.get('studentGroups', []),
             "related_employees": exam.get('employees', []),
-            "subgroup": exam.get('numSubgroup', 0)
+            "subgroup": exam.get('numSubgroup', 0),
         })
 
-    # 3. Перезапись событий
     await session.execute(delete(ScheduleEvent).where(
         ScheduleEvent.entity_name == entity_name, ScheduleEvent.entity_type == entity_type
     ))
     
     if events:
-        # Вставляем записи без search_vector
         await session.execute(insert(ScheduleEvent), events)
         
-        # 4. Генерируем search_vector в базе
         sql_update_vector = """
         UPDATE schedule_events
         SET search_vector = to_tsvector('russian', 
@@ -456,7 +437,6 @@ async def sync_all_employee_schedules(session: AsyncSession, client: BsuirApiCli
                 await _process_schedule_json(session, emp.url_id, 'employee', data, employee_id=emp.id)
             
             await session.commit()
-            
             if idx > 0 and idx % 50 == 0:
                 logger.info(f"Прогресс сотрудников: {idx} / {len(employees)}")
                 
