@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    DB_DSN: str
+    DATABASE_URL: str
     API_BASE_URL: str = "https://iis.bsuir.by/api/v1"
     CONCURRENCY_LIMIT: int = 5
     LOG_LEVEL: str = "INFO"
