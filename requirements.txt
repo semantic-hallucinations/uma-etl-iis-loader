@@ -1,0 +1,7 @@
+sqlalchemy[asyncio]
+asyncpg
+httpx
+loguru
+pydantic-settings
+python-dotenv
+tenacity
